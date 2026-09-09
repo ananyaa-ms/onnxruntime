@@ -1,6 +1,6 @@
-# QDQ MatMul NPU Compatibility
+# QDQ NPU Compatibility
 
-Generate a configurable opset-21 QDQ MatMul model and run it on CPU or a Windows ML NPU execution provider.
+Generate configurable QDQ MatMul and normalization models and run them on CPU or a Windows ML NPU execution provider.
 
 ## Set up
 
@@ -40,6 +40,51 @@ Add `--add-vitisai-metadata` to write the CLIP model identity and Vitis AI quant
 ```
 
 The default input shape is `[1, 2520, 768]`, the default weight shape is `[768, 768]`, and the default output is `unit-models\clip_visual_dq_matmul_q.onnx`. Run `.\.venv\Scripts\python.exe .\generate_qdq_matmul_model.py -h` for all options.
+
+## Generate normalization unit models
+
+`generate_qdq_normalization_model.py` generates three activation-quantized patterns. Inputs and outputs are float32 so the runners can supply and compare them; uint16 Q/DQ pairs surround the operator boundaries, while constant scales and multipliers use uint8 DQ.
+
+| Pattern | Core graph | Default shape | Default output |
+|---|---|---|---|
+| `rmsnorm` | DQ -> `RMSNormalization` -> Q | `[1, 2520, 768]` | `unit-models\gemma_dq_rmsnorm_q.onnx` |
+| `sslrn` | DQ inputs -> `com.microsoft::SkipSimplifiedLayerNormalization` -> Q | `[1, 2520, 768]` | `unit-models\gemma_dq_sslrn_q.onnx` |
+| `add-lpnorm-mul` | QDQ `Add` -> QDQ `LpNormalization` -> QDQ `Mul` | `[1, 512]` | `unit-models\clip_qdq_add_lpnorm_mul.onnx` |
+
+Generate the models:
+
+```powershell
+.\.venv\Scripts\python.exe .\generate_qdq_normalization_model.py --pattern rmsnorm
+.\.venv\Scripts\python.exe .\generate_qdq_normalization_model.py --pattern sslrn
+.\.venv\Scripts\python.exe .\generate_qdq_normalization_model.py --pattern add-lpnorm-mul
+```
+
+Use `--input-shape DIM [DIM ...]` to test another concrete shape. `--qdq-profile microsoft` switches Q/DQ nodes to `com.microsoft` opset 1 while retaining the standard-domain normalization ops at opset 23.
+
+## Shapes observed in the original graphs
+
+The following tables were collected from `amd-clip/clip_vit_base_patch16_amd.onnx` and `fp32-gemma4-e2b-it/vision_encoder/model.onnx` after ONNX shape inference. Symbolic dimensions are preserved as exported.
+
+### CLIP normalization shapes
+
+| Operator | Input shape | Parameter shapes | Output shape | Attributes | Count |
+|---|---|---|---|---|---:|
+| `LayerNormalization` | `[10, 77, 512]` | scale `[512]`, bias `[512]` | `[10, 77, 512]` | axis `-1`, epsilon `1e-5` | 25 |
+| `LayerNormalization` | `[1, 197, 768]` | scale `[768]`, bias `[768]` | `[1, 197, 768]` | axis `-1`, epsilon `1e-5` | 25 |
+| `LayerNormalization` | `[1, 768]` | scale `[768]`, bias `[768]` | `[1, 768]` | axis `-1`, epsilon `1e-5` | 1 |
+| `LpNormalization` | `[1, 512]` | - | `[1, 512]` | axis `-1`, p `2` | 1 |
+| `LpNormalization` | `[10, 512]` | - | `[10, 512]` | axis `-1`, p `2` | 1 |
+
+Every listed CLIP normalization input is produced by DQ and every output feeds Q in the source graph.
+
+### Gemma-4-E2B-IT vision normalization shapes
+
+| Operator | Input shape | Parameter/input shapes | Output shape | Attributes | Count |
+|---|---|---|---|---|---:|
+| `RMSNormalization` | `[batch, num_patches, 12, 64]` | scale `[64]` | `[batch, num_patches, 12, 64]` | axis `-1`, epsilon `1e-6` | 48 |
+| `RMSNormalization` | `[batch, num_patches, 768]` | scale `[768]` | `[batch, num_patches, 768]` | axis `-1`, epsilon `1e-6` | 32 |
+| `RMSNormalization` | `[batch, _d0, 768]` | scale `[768]` | `[batch, _d0, 768]` | axis `-1`, epsilon `1e-6` | 1 |
+| `SkipSimplifiedLayerNormalization` | `[batch, num_patches, 768]` | skip `[batch, num_patches, 768]`, gamma `[768]` | `[batch, num_patches, 768]` | epsilon `1e-6` | 32 |
 
 
 ### Gemma-4-E2B-IT vision model's MatMul shapes for reference
