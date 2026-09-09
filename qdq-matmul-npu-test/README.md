@@ -43,13 +43,13 @@ The default input shape is `[1, 2520, 768]`, the default weight shape is `[768, 
 
 ## Generate normalization unit models
 
-`generate_qdq_normalization_model.py` generates three activation-quantized patterns. Inputs and outputs are float32 so the runners can supply and compare them; uint16 Q/DQ pairs surround the operator boundaries, while constant scales and multipliers use uint8 DQ.
+`generate_qdq_normalization_model.py` generates three activation-quantized patterns. Inputs and outputs are float32 so the runners can supply and compare them; uint16 Q/DQ pairs surround the operator boundaries, while constant normalization scales use uint8 DQ. The `add-lpnorm-mul` pattern takes same-shaped `input`, `addend`, and `multiplier` activation inputs.
 
 | Pattern | Core graph | Default shape | Default output |
 |---|---|---|---|
 | `rmsnorm` | DQ -> `RMSNormalization` -> Q | `[1, 2520, 768]` | `unit-models\gemma_dq_rmsnorm_q.onnx` |
 | `sslrn` | DQ inputs -> `com.microsoft::SkipSimplifiedLayerNormalization` -> Q | `[1, 2520, 768]` | `unit-models\gemma_dq_sslrn_q.onnx` |
-| `add-lpnorm-mul` | QDQ `Add` -> QDQ `LpNormalization` -> QDQ `Mul` | `[1, 512]` | `unit-models\clip_qdq_add_lpnorm_mul.onnx` |
+| `add-lpnorm-mul` | QDQ `Add` -> QDQ `LpNormalization` -> QDQ `Mul` | `[1, 512]` (CLIP image) | `unit-models\clip_qdq_add_lpnorm_mul.onnx` |
 
 Generate the models:
 
@@ -59,7 +59,24 @@ Generate the models:
 .\.venv\Scripts\python.exe .\generate_qdq_normalization_model.py --pattern add-lpnorm-mul
 ```
 
-Use `--input-shape DIM [DIM ...]` to test another concrete shape. `--qdq-profile microsoft` switches Q/DQ nodes to `com.microsoft` opset 1 while retaining the standard-domain normalization ops at opset 23.
+The CLIP image LpNorm site is the default, with shape `[1, 512]`. Use `--clip-lpnorm-site text` for the original text site with shape `[10, 512]`:
+
+```powershell
+.\.venv\Scripts\python.exe .\generate_qdq_normalization_model.py `
+    --pattern add-lpnorm-mul `
+    --clip-lpnorm-site text
+```
+
+Both sites use their original input and output uint16 quantization parameters. Use `--input-shape DIM [DIM ...]` to test another concrete shape.
+
+`--qdq-profile onnx` uses default-domain Q/DQ at opset 23. To match the original CLIP model's `com.microsoft` Q/DQ domain and opset, run:
+
+```powershell
+.\.venv\Scripts\python.exe .\generate_qdq_normalization_model.py `
+    --pattern add-lpnorm-mul `
+    --clip-lpnorm-site image `
+    --qdq-profile microsoft
+```
 
 ## Shapes observed in the original graphs
 

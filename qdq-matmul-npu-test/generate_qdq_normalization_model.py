@@ -18,21 +18,47 @@ class QdqProfile:
     qdq_opset: int
 
 
+@dataclass(frozen=True)
+class ClipLpNorm:
+    shape: tuple[int, int]
+    input_scale: float
+    input_zero_point: int
+    output_scale: float
+    output_zero_point: int
+
+
 QDQ_PROFILES = {
     "onnx": QdqProfile("", 23),
     "microsoft": QdqProfile("com.microsoft", 1),
 }
 
+PATTERNS = ("rmsnorm", "sslrn", "add-lpnorm-mul")
+
+CLIP_LPNORM_SITES = {
+    "image": ClipLpNorm(
+        (1, 512),
+        0.00015079299919307232,
+        16116,
+        0.000014544223631673958,
+        16488,
+    ),
+    "text": ClipLpNorm(
+        (10, 512),
+        0.00008716459706192836,
+        14058,
+        0.00001152162531070644,
+        15586,
+    ),
+}
+
 DEFAULT_SHAPES = {
     "rmsnorm": (1, 2520, 768),
     "sslrn": (1, 2520, 768),
-    "add-lpnorm-mul": (1, 512),
 }
 
 DEFAULT_OUTPUTS = {
     "rmsnorm": "gemma_dq_rmsnorm_q.onnx",
     "sslrn": "gemma_dq_sslrn_q.onnx",
-    "add-lpnorm-mul": "clip_qdq_add_lpnorm_mul.onnx",
 }
 
 ACTIVATION_SCALE = np.float32(1.0 / 4096.0)
@@ -45,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pattern",
-        choices=tuple(DEFAULT_SHAPES),
+        choices=PATTERNS,
         default="rmsnorm",
         help="Operator pattern to generate; default: rmsnorm.",
     )
@@ -62,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         help="Override the source-model-based input shape.",
     )
     parser.add_argument(
+        "--clip-lpnorm-site",
+        choices=tuple(CLIP_LPNORM_SITES),
+        default="image",
+        help=(
+            "Original CLIP LpNormalization site used by add-lpnorm-mul; "
+            "default: image."
+        ),
+    )
+    parser.add_argument(
         "--qdq-profile",
         choices=tuple(QDQ_PROFILES),
         default="onnx",
@@ -75,10 +110,18 @@ def parse_args() -> argparse.Namespace:
     ):
         parser.error("--input-shape dimensions must be positive")
     if args.output is None:
+        output_name = DEFAULT_OUTPUTS.get(
+            args.pattern,
+            (
+                "clip_qdq_add_lpnorm_mul.onnx"
+                if args.clip_lpnorm_site == "image"
+                else "clip_text_qdq_add_lpnorm_mul.onnx"
+            ),
+        )
         args.output = (
             Path(__file__).resolve().parent
             / "unit-models"
-            / DEFAULT_OUTPUTS[args.pattern]
+            / output_name
         )
     return args
 
@@ -138,66 +181,85 @@ def add_output_qdq(
 
 
 def make_initializers(
-    pattern: str, hidden_size: int, rng: np.random.Generator
+    pattern: str,
+    hidden_size: int,
+    rng: np.random.Generator,
+    clip_lpnorm: ClipLpNorm,
 ) -> list[onnx.TensorProto]:
-    norm_scale = np.clip(
-        rng.normal(1.0, 0.02, hidden_size), 0.9, 1.1
-    ).astype(np.float32)
-    norm_scale_quantized = np.clip(
-        np.rint(norm_scale / NORM_SCALE_SCALE) + NORM_SCALE_ZERO_POINT,
-        0,
-        255,
-    ).astype(np.uint8)
-    multiplier = np.clip(
-        rng.normal(1.0, 0.02, hidden_size), 0.9, 1.1
-    ).astype(np.float32)
-    multiplier_quantized = np.clip(
-        np.rint(multiplier / NORM_SCALE_SCALE) + NORM_SCALE_ZERO_POINT,
-        0,
-        255,
-    ).astype(np.uint8)
-
+    activation_scale = (
+        np.float32(clip_lpnorm.input_scale)
+        if pattern == "add-lpnorm-mul"
+        else ACTIVATION_SCALE
+    )
+    activation_zero_point = (
+        np.uint16(clip_lpnorm.input_zero_point)
+        if pattern == "add-lpnorm-mul"
+        else ACTIVATION_ZERO_POINT
+    )
+    output_scale = (
+        np.float32(clip_lpnorm.output_scale)
+        if pattern == "add-lpnorm-mul"
+        else ACTIVATION_SCALE
+    )
+    output_zero_point = (
+        np.uint16(clip_lpnorm.output_zero_point)
+        if pattern == "add-lpnorm-mul"
+        else ACTIVATION_ZERO_POINT
+    )
     initializers = [
-        numpy_helper.from_array(ACTIVATION_SCALE, "activation_scale"),
+        numpy_helper.from_array(activation_scale, "activation_scale"),
         numpy_helper.from_array(
-            np.asarray(ACTIVATION_ZERO_POINT), "activation_zero_point"
+            np.asarray(activation_zero_point), "activation_zero_point"
         ),
-        numpy_helper.from_array(ACTIVATION_SCALE, "output_scale"),
+        numpy_helper.from_array(output_scale, "output_scale"),
         numpy_helper.from_array(
-            np.asarray(ACTIVATION_ZERO_POINT), "output_zero_point"
-        ),
-        numpy_helper.from_array(
-            np.asarray(NORM_SCALE_SCALE), "constant_scale"
-        ),
-        numpy_helper.from_array(
-            np.asarray(NORM_SCALE_ZERO_POINT), "constant_zero_point"
+            np.asarray(output_zero_point), "output_zero_point"
         ),
     ]
     if pattern in {"rmsnorm", "sslrn"}:
-        initializers.append(
-            numpy_helper.from_array(
-                norm_scale_quantized, "norm_scale_quantized"
-            )
-        )
-    else:
-        initializers.append(
-            numpy_helper.from_array(
-                multiplier_quantized, "multiplier_quantized"
-            )
+        norm_scale = np.clip(
+            rng.normal(1.0, 0.02, hidden_size), 0.9, 1.1
+        ).astype(np.float32)
+        norm_scale_quantized = np.clip(
+            np.rint(norm_scale / NORM_SCALE_SCALE) + NORM_SCALE_ZERO_POINT,
+            0,
+            255,
+        ).astype(np.uint8)
+        initializers.extend(
+            [
+                numpy_helper.from_array(
+                    np.asarray(NORM_SCALE_SCALE), "constant_scale"
+                ),
+                numpy_helper.from_array(
+                    np.asarray(NORM_SCALE_ZERO_POINT), "constant_zero_point"
+                ),
+                numpy_helper.from_array(
+                    norm_scale_quantized, "norm_scale_quantized"
+                ),
+            ]
         )
     return initializers
 
 
 def build_model(args: argparse.Namespace) -> onnx.ModelProto:
     profile = QDQ_PROFILES[args.qdq_profile]
+    clip_lpnorm = CLIP_LPNORM_SITES[args.clip_lpnorm_site]
+    default_shape = (
+        clip_lpnorm.shape
+        if args.pattern == "add-lpnorm-mul"
+        else DEFAULT_SHAPES[args.pattern]
+    )
     input_shape = (
-        DEFAULT_SHAPES[args.pattern]
+        default_shape
         if args.input_shape is None
         else tuple(args.input_shape)
     )
     hidden_size = input_shape[-1]
     initializers = make_initializers(
-        args.pattern, hidden_size, np.random.default_rng(args.seed)
+        args.pattern,
+        hidden_size,
+        np.random.default_rng(args.seed),
+        clip_lpnorm,
     )
     nodes: list[onnx.NodeProto] = []
     graph_inputs = [
@@ -322,27 +384,27 @@ def build_model(args: argparse.Namespace) -> onnx.ModelProto:
             nodes,
             "normalized",
             "normalized_dequantized",
-            "activation_scale",
-            "activation_zero_point",
+            "output_scale",
+            "output_zero_point",
+            profile,
+        )
+        graph_inputs.append(
+            helper.make_tensor_value_info(
+                "multiplier", TensorProto.FLOAT, input_shape
+            )
+        )
+        add_qdq(
+            nodes,
+            "multiplier",
+            "multiplier_dequantized",
+            "output_scale",
+            "output_zero_point",
             profile,
         )
         nodes.append(
             helper.make_node(
-                "DequantizeLinear",
-                [
-                    "multiplier_quantized",
-                    "constant_scale",
-                    "constant_zero_point",
-                ],
-                ["multiplier"],
-                name="DequantizeMultiplier",
-                domain=profile.qdq_domain,
-            )
-        )
-        nodes.append(
-            helper.make_node(
                 "Mul",
-                ["normalized_dequantized", "multiplier"],
+                ["normalized_dequantized", "multiplier_dequantized"],
                 ["multiplied"],
                 name="Mul",
             )
@@ -376,6 +438,10 @@ def build_model(args: argparse.Namespace) -> onnx.ModelProto:
     model.ir_version = 8
     model.metadata_props.add(key="pattern", value=args.pattern)
     model.metadata_props.add(key="qdq_profile", value=args.qdq_profile)
+    if args.pattern == "add-lpnorm-mul":
+        model.metadata_props.add(
+            key="clip_lpnorm_site", value=args.clip_lpnorm_site
+        )
     model.metadata_props.add(
         key="input_shape", value="x".join(str(value) for value in input_shape)
     )
